@@ -8,25 +8,30 @@ date: "2024-11-13"
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-``` {r}
+```{r}
 library(shiny)
 library(leaflet)
 library(dplyr)
 library(sf)
 library(shinydashboard)
 library(ggplot2)
-library(ggtext)
 library(tidyverse)
-library(rsconnect)
+library(lubridate)
 
-rsconnect::setAccountInfo(name='7r041x-zain-mahajan', token='FD6AB6AC238FD9EA0DD768BCE5817DC3', secret='yS25MixmEmUVF3Pdj6d058wrKfQXU4PDdcbUVVuC')
+df <- read.csv("202410-citibike-tripdata_1.csv")
 
-df <- read.csv("202410-citibike-tripdata_1.csv", nrows = 10000)
-df_sample <- df %>% slice_head(n = 100)
+df_copy <- df
+
+df_copy <- na.omit(df_copy)
+
+df_copy$started_at <- as.POSIXct(df_copy$started_at, format = "%Y-%m-%d %H:%M:%S")
+df_copy$ended_at <- as.POSIXct(df_copy$ended_at, format = "%Y-%m-%d %H:%M:%S")
+
+df_copy$time <- as.numeric(difftime(df_copy$ended_at, df_copy$started_at, units = "mins"))
+
 boroughs <- st_read("Borough_Boundaries.geojson")
-
-nyc <- st_read("Borough Boundaries/geo_export_04945c58-0c97-41b7-a30a-52422ea28320.shp", quiet=TRUE, stringsAsFactors=FALSE)
-nyc <- st_transform(nyc, 4326)
+nyc <- st_read("Borough Boundaries/geo_export_04945c58-0c97-41b7-a30a-52422ea28320.shp", quiet = TRUE, stringsAsFactors = FALSE) %>%
+  st_transform(4326)
 
 map2(df$start_lng, df$start_lat, ~st_point(c(.x, .y))) %>% 
   st_sfc(crs = 4326) %>% 
@@ -50,8 +55,44 @@ df <- bind_cols(
   select(ride_id, rideable_type, started_at, ended_at, start_station_name, start_station_id, end_station_name, end_station_id, start_lng, start_lat, end_lng, end_lat, member_casual, borough_name_start, borough_name_end=boro_name) %>% 
   mutate(borough_name_end = str_to_title(borough_name_end))
 
-#adding time column
+df_copy <- df_copy %>%
+  mutate(
+    start_sf = st_as_sf(., coords = c("start_lng", "start_lat"), crs = 4326, remove = FALSE),
+    end_sf = st_as_sf(., coords = c("end_lng", "end_lat"), crs = 4326, remove = FALSE),
+    start_borough_name = st_join(start_sf, boroughs[, c("boro_name", "geometry")])$boro_name,
+    end_borough_name = st_join(end_sf, boroughs[, c("boro_name", "geometry")])$boro_name
+  ) %>%
+  select(-start_sf, -end_sf)
+
+df_copy <- df_copy %>% filter(end_borough_name != "Staten Island")
+
+write.csv(df, file = "df.csv", row.names = FALSE)
+write.csv(df_copy, file = "df_copy.csv", row.names = FALSE)
+```
+
+```{r}
+library(shiny)
+library(leaflet)
+library(dplyr)
+library(sf)
+library(shinydashboard)
+library(ggplot2)
+library(ggtext)
+library(tidyverse)
+library(rsconnect)
+library(lubridate)
+
+df <- read.csv("df.csv")
+df_copy <- read.csv("df_copy.csv")
+
+df <- na.omit(df)
 df$time <- difftime(df$ended_at, df$started_at, units="mins")
+
+boroughs <- st_read("Borough_Boundaries.geojson")
+nyc <- st_read("Borough Boundaries/geo_export_04945c58-0c97-41b7-a30a-52422ea28320.shp", quiet=TRUE, stringsAsFactors=FALSE)
+nyc <- st_transform(nyc, 4326)
+
+boroughs$color <- colorFactor(palette = "Set3", domain = boroughs$boro_name)(boroughs$boro_name)
 
 df2 <- df %>% mutate(member_ratio = case_when(
   member_casual == "member" ~ 1,
@@ -78,13 +119,13 @@ draw_plot <- function(filter_boro, change_axis) {
     filter(borough_name_start == !!filter_boro)
   ggplot(filtered_boros, aes(x=borough_name_end, y = .data[[change_axis]], fill = borough_name_end)) +
     geom_bar(stat="identity") +  
-  xlab("Ending boroughs") +
-  ylab(y_axis_label) +
+    xlab("Ending boroughs") +
+    ylab(y_axis_label) +
     labs(fill="Starting borough") + 
     geom_text(aes(label = round(.data[[change_axis]],2))) +
-  ggtitle(paste0("<b>", title_label, "</b><br>\nwith <b><i><span style='color:green'>", filter_boro, "</span></i></b> as the starting borough")) +
-  guides(fill="none") +
-  theme(plot.title = ggtext::element_markdown())
+    ggtitle(paste0("<b>", title_label, "</b><br>\nwith <b><i><span style='color:green'>", filter_boro, "</span></i></b> as the starting borough")) +
+    guides(fill="none") +
+    theme(plot.title = ggtext::element_markdown())
 }
 
 ui <- dashboardPage(
@@ -98,11 +139,28 @@ ui <- dashboardPage(
   ),
   dashboardBody(
     tabItems(
-      # citibike map tab
       tabItem("citibike",
+              h2("CitiBike Random Trip Sample"),  
+              numericInput("min_time", "Minimum Trip Duration (minutes):", value = 5, min = 0, max = max(df_copy$time, na.rm = TRUE)),
+              numericInput("max_time", "Maximum Trip Duration (minutes):", value = 30, min = 0, max = max(df_copy$time, na.rm = TRUE)),
+              sliderInput("trip_count", 
+                          "Number of Trips to Display:", 
+                          min = 1, 
+                          max = 1000, 
+                          value = 50, 
+                          step = 1),
+              selectInput("start_borough", "Select Starting Borough:", 
+                          choices = c("Any", unique(na.omit(df_copy$start_borough_name))),
+                          selected = "Any"),
+              selectInput("end_borough", "Select Ending Borough:", 
+                          choices = c("Any", unique(na.omit(df_copy$end_borough_name))),
+                          selected = "Any"),
+              actionButton("resample", "Generate New Sample"),
+              p(style = "color: red; margin-top: 10px; margin-bottom: 10px;",
+                "Some inputs will cause errors due to no data such as a large amount 
+                         of rides starting in Bronx that end in Brooklyn."),
               leafletOutput("nycMap", height = 600)
       ),
-      # citibike charts tab
       tabItem("charts", 
         fluidRow(
           box(
@@ -127,56 +185,111 @@ ui <- dashboardPage(
       ),
       #readme tab
       tabItem("readme",
-        fluidPage(
-          h1("Information"),
-          p("The map in the 'Citibike Map' tab shows the green starting and ending points of Citibike trips, connected by blue lines. The graph in the charts tab changes depending on which starting borough and y-axis variable you choose."),
-          )
-        )
+              fluidPage(
+                h1("Information"),
+                p("The map in the 'Citibike Map' tab shows the green starting and red ending points of randomly sampled Citibike trips, connected by blue lines. The graph in the charts tab changes depending on which starting borough and y-axis variable you choose."),
+              )
+      )
     )
   )
-    
+  
 )
 
 server <- function(input, output, session) {
-  # citibike map
-output$nycMap <- renderLeaflet({
-  map <- leaflet(df_sample) %>%
-    addProviderTiles(providers$OpenStreetMap) %>%
-    setView(lng = mean(df_sample$start_lng), lat = mean(df_sample$start_lat), zoom = 12)
-
-  map <- map %>% addCircleMarkers(
-    lng = ~start_lng, lat = ~start_lat,
-    color = "green", radius = 4, 
-    popup = ~paste("Start Point: ", start_lat, ", ", start_lng)
-  )
+  resample_trigger <- reactiveVal(0)
+  observeEvent(input$resample, {
+    resample_trigger(resample_trigger() + 1)
+  })
   
-  map <- map %>% addCircleMarkers(
-    lng = ~end_lng, lat = ~end_lat,
-    color = "green", radius = 4,
-    popup = ~paste("End Point: ", end_lat, ", ", end_lng)
-  )
+  filtered_data <- reactive({
+    resample_trigger()
+    
+    df_copy %>%
+      filter(
+        (input$start_borough == "Any" | start_borough_name == input$start_borough),
+        (input$end_borough == "Any" | end_borough_name == input$end_borough),
+        time >= input$min_time, time <= input$max_time
+      ) %>%
+      sample_n(input$trip_count, replace = FALSE) %>%
+      filter(!is.na(start_lng) & !is.na(start_lat) & !is.na(end_lng) & !is.na(end_lat))
+  })
   
-  for (i in 1:nrow(df_sample)) {
-    map <- map %>% addPolylines(
-      lng = c(df_sample$start_lng[i], df_sample$end_lng[i]),
-      lat = c(df_sample$start_lat[i], df_sample$end_lat[i]),
-      color = "blue", weight = 2, opacity = 0.7
-    )
-  }
-
-  map <- map %>% addPolygons(
-    data = boroughs,
-    color = "red", weight = 2, opacity = 0.8, fill = TRUE,
-    label = ~boro_name
-  )
-
-  map
-})
-
+  observe({
+    updateSelectInput(session, "start_borough", 
+                      choices = c("Any", unique(na.omit(df_copy$start_borough_name))),
+                      selected = input$start_borough)
+    
+    updateSelectInput(session, "end_borough", 
+                      choices = c("Any", unique(na.omit(df_copy$end_borough_name))),
+                      selected = input$end_borough)
+  })
+  
+  output$nycMap <- renderLeaflet({
+    df_filtered <- filtered_data()
+    
+    df_filtered$started_at <- as.POSIXct(df_filtered$started_at, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+    
+    map <- leaflet(df_filtered) %>%
+      addProviderTiles(providers$OpenStreetMap) %>%
+      setView(lng = mean(df_filtered$start_lng), lat = mean(df_filtered$start_lat), zoom = 11)
+    
+    map <- map %>%
+      addPolygons(
+        data = boroughs,
+        color = ~color, weight = 2, opacity = 0.8, 
+        fillColor = ~color, fillOpacity = 0.5,
+        label = ~boro_name
+      )
+    
+    map <- map %>%
+      addCircleMarkers(
+        lng = ~start_lng, lat = ~start_lat,
+        color = "green", radius = 5,
+        label = ~paste("Start Station ID:", start_station_id)
+      ) %>%
+      addCircleMarkers(
+        lng = ~end_lng, lat = ~end_lat,
+        color = "red", radius = 5,
+        label = ~paste("End Station ID:", end_station_id)
+      )
+    
+    map <- map %>%
+      addLegend(
+        position = "topright",
+        colors = c("green", "red"),
+        labels = c("Starting Stations", "Ending Stations"),
+        title = "Station Types",
+        opacity = 1
+      )
+    
+    for (i in 1:nrow(df_filtered)) {
+      trip_date <- ifelse(
+        !is.na(df_filtered$started_at[i]),
+        format(df_filtered$started_at[i], "%Y-%m-%d"),
+        "Unknown Date"
+      )
+      
+      map <- map %>%
+        addPolylines(
+          lng = c(df_filtered$start_lng[i], df_filtered$end_lng[i]),
+          lat = c(df_filtered$start_lat[i], df_filtered$end_lat[i]),
+          color = "blue", weight = 2, opacity = 0.7,
+          label = HTML(paste(
+            "Start Station ID:", df_filtered$start_station_id[i], "<br>",
+            "End Station ID:", df_filtered$end_station_id[i], "<br>",
+            "Trip Date:", trip_date, "<br>",
+            "User Type:", df_filtered$member_casual[i], "<br>",
+            "Trip Duration (mins):", round(df_filtered$time[i], 2)
+          ))
+        )
+    }
+    
+    map
+  })
+  
   output$boro_chart <- renderPlot(draw_plot(input$borough_name, input$axis_name))
   output$boro_line <- renderPlot(draw_plot2(input$borough_name))
 }
 
 shinyApp(ui, server)
-
 ```
